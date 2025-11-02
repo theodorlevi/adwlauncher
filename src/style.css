@@ -1,0 +1,18 @@
+window {
+    border-radius: 13px;
+    margin: 10px;
+    border: 1px solid #333;
+}
+
+button {
+    border: 1px solid transparent;
+}
+
+button.selected {
+    background-color: alpha(@accent_bg_color, 0.3);
+    border: 1px solid @accent_bg_color;
+}
+
+button.selected:hover {
+    background-color: alpha(@accent_bg_color, 0.4);
+}

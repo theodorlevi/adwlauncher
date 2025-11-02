@@ -1,0 +1,11 @@
+[package]
+name = "adwlauncher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk4-layer-shell = "0.7.0"
+freedesktop-desktop-entry = "0.7.19"
+niri-ipc = "25.8.0"
+relm4 = { version = "0.10.0", features = ["gnome_48", "libadwaita"] }
+fuzzy-matcher = "0.3.7"
