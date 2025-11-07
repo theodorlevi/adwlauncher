@@ -5,6 +5,7 @@ use gtk::prelude::WidgetExt;
 use gtk::prelude::*;
 use gtk4_layer_shell::{Layer, LayerShell};
 use niri_ipc::{Action, Request, Response};
+use rayon::prelude::*;
 use relm4::factory::FactoryVecDeque;
 use relm4::gtk::CssProvider;
 use relm4::prelude::*;
@@ -30,52 +31,49 @@ struct Entry {
     icon: String,
     name: String,
 }
-
 fn get_entries() -> Vec<Entry> {
     let mut entries = vec![];
-
     // Check both system and user application directories
+    let home = std::env::var("HOME").unwrap_or_default();
     let app_dirs = vec![
         std::path::PathBuf::from("/usr/share/applications"),
-        std::path::PathBuf::from(format!(
-            "{}/.local/share/applications",
-            env!("HOME").to_string()
-        )),
+        std::path::PathBuf::from(format!("{}/.local/share/applications", home)),
         std::path::PathBuf::from("/var/lib/flatpak/exports/share/applications/"),
+        std::path::PathBuf::from(format!(
+            "{}/.local/share/flatpak/exports/share/applications/",
+            home
+        )),
     ];
-
     for app_dir in app_dirs {
         let dir = match std::fs::read_dir(&app_dir) {
             Ok(dir) => dir,
             Err(_) => continue, // Skip if the directory doesn't exist
         };
-
-        for file in dir {
-            let mut entry = Entry::default();
-            let file = match file {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let path = file.path();
-            let desktop_file = match DesktopEntry::from_path(path, None::<&[&str]>) {
-                Ok(df) => df,
-                Err(_) => continue,
-            };
-            entry.name = desktop_file.name(&[""]).unwrap_or_default().to_string();
-            if entry.name.is_empty() {
-                continue;
-            }
-            entry.exec = desktop_file.exec().unwrap_or_default().to_string();
-            entry.icon = desktop_file.icon().unwrap_or_default().to_string();
-            entry.open_type = if desktop_file.terminal() {
-                OpenType::Terminal
-            } else {
-                OpenType::Graphical
-            };
-            entries.push(entry);
-        }
+        let new_entries: Vec<Entry> = dir
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .filter_map(|file| {
+                let file = file.ok()?;
+                let path = file.path();
+                let desktop_file = DesktopEntry::from_path(path, None::<&[&str]>).ok()?;
+                let name = desktop_file.name(&[""]).unwrap_or_default().to_string();
+                if name.is_empty() {
+                    return None;
+                }
+                Some(Entry {
+                    name,
+                    exec: desktop_file.exec().unwrap_or_default().to_string(),
+                    icon: desktop_file.icon().unwrap_or_default().to_string(),
+                    open_type: if desktop_file.terminal() {
+                        OpenType::Terminal
+                    } else {
+                        OpenType::Graphical
+                    },
+                })
+            })
+            .collect();
+        entries.extend(new_entries);
     }
-
     let mut soc = niri_ipc::socket::Socket::connect().unwrap();
     let response = soc.send(Request::Windows).unwrap().unwrap();
     let windows = match response {
@@ -151,6 +149,7 @@ struct App {
     search_query: String,
     scrolled_window: gtk::ScrolledWindow,
     search_entry: gtk::SearchEntry,
+    window: adw::ApplicationWindow,
 }
 
 impl std::fmt::Debug for App {
@@ -169,6 +168,7 @@ enum Msg {
     SelectEntry,
     CloseWindow,
     SearchChanged(String),
+    WindowShown,
 }
 
 #[relm4::component]
@@ -237,6 +237,7 @@ impl SimpleComponent for App {
             search_query: String::new(),
             scrolled_window: gtk::ScrolledWindow::new(),
             search_entry: gtk::SearchEntry::new(),
+            window: root.clone(),
         };
 
         // Add all desktop entries to the factory
@@ -313,6 +314,12 @@ impl SimpleComponent for App {
             _ => gtk::glib::Propagation::Proceed,
         });
         widgets.window.add_controller(key_controller);
+
+        // Connect to window show signal to reload entries
+        let sender_clone = sender.clone();
+        widgets.window.connect_show(move |_| {
+            sender_clone.input(Msg::WindowShown);
+        });
 
         ComponentParts { model, widgets }
     }
@@ -411,11 +418,19 @@ impl SimpleComponent for App {
                 }
             }
             Msg::CloseWindow => {
-                std::process::exit(0);
+                self.window.set_visible(false);
             }
             Msg::SearchChanged(query) => {
                 self.search_query = query;
                 self.filter_entries();
+            }
+            Msg::WindowShown => {
+                // Reload all entries when window is shown
+                self.all_entries = get_entries();
+                self.search_query.clear();
+                self.search_entry.set_text("");
+                self.filter_entries();
+                self.search_entry.grab_focus();
             }
         }
     }
@@ -539,5 +554,20 @@ impl App {
 
 fn main() {
     let app = RelmApp::new("me.bofusland.adwlauncher");
+
+    // Check if we're running with --gapplication-service flag
+    let has_service_flag = std::env::args().nth(1) == Some("--gapplication-service".to_string());
+
+    if !has_service_flag {
+        let gtk_app = relm4::main_adw_application();
+
+        gtk_app.connect_startup(move |app| {
+            // Only print if we're the primary instance (not remote)
+            if !app.is_remote() {
+                println!("Please run with --gapplication-service");
+            }
+        });
+    }
+
     app.run::<App>(());
 }

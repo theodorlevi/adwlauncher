@@ -1,5 +1,5 @@
 window {
-    border-radius: 13px;
+    border-radius: 15px;
     margin: 10px;
     border: 1px solid #333;
 }
@@ -9,10 +9,10 @@ button {
 }
 
 button.selected {
-    background-color: alpha(@accent_bg_color, 0.3);
+    background-color: alpha(@accent_bg_color, 1);
     border: 1px solid @accent_bg_color;
 }
 
 button.selected:hover {
-    background-color: alpha(@accent_bg_color, 0.4);
+    background-color: alpha(@accent_bg_color, 1);
 }
