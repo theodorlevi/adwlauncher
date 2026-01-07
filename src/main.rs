@@ -1,96 +1,24 @@
-use freedesktop_desktop_entry::DesktopEntry;
+// Suppress warnings from relm4 macro-generated code
+#![allow(unused_assignments)]
+
+mod app_discovery;
+mod cache;
+mod error;
+mod icon;
+mod types;
+mod usage;
+
+use app_discovery::{get_entries, launch_entry};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use gtk::prelude::WidgetExt;
 use gtk::prelude::*;
 use gtk4_layer_shell::{Layer, LayerShell};
-use niri_ipc::{Action, Request, Response};
-use rayon::prelude::*;
 use relm4::factory::FactoryVecDeque;
 use relm4::gtk::CssProvider;
 use relm4::prelude::*;
-use std::cmp::PartialEq;
-
-#[derive(Debug, PartialEq, Clone)]
-enum OpenType {
-    Graphical,
-    Terminal,
-    Window,
-}
-
-impl Default for OpenType {
-    fn default() -> Self {
-        Self::Graphical
-    }
-}
-
-#[derive(Default, Debug, Clone)]
-struct Entry {
-    open_type: OpenType,
-    exec: String,
-    icon: String,
-    name: String,
-}
-fn get_entries() -> Vec<Entry> {
-    let mut entries = vec![];
-    // Check both system and user application directories
-    let home = std::env::var("HOME").unwrap_or_default();
-    let app_dirs = vec![
-        std::path::PathBuf::from("/usr/share/applications"),
-        std::path::PathBuf::from(format!("{}/.local/share/applications", home)),
-        std::path::PathBuf::from("/var/lib/flatpak/exports/share/applications/"),
-        std::path::PathBuf::from(format!(
-            "{}/.local/share/flatpak/exports/share/applications/",
-            home
-        )),
-    ];
-    for app_dir in app_dirs {
-        let dir = match std::fs::read_dir(&app_dir) {
-            Ok(dir) => dir,
-            Err(_) => continue, // Skip if the directory doesn't exist
-        };
-        let new_entries: Vec<Entry> = dir
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .filter_map(|file| {
-                let file = file.ok()?;
-                let path = file.path();
-                let desktop_file = DesktopEntry::from_path(path, None::<&[&str]>).ok()?;
-                let name = desktop_file.name(&[""]).unwrap_or_default().to_string();
-                if name.is_empty() {
-                    return None;
-                }
-                Some(Entry {
-                    name,
-                    exec: desktop_file.exec().unwrap_or_default().to_string(),
-                    icon: desktop_file.icon().unwrap_or_default().to_string(),
-                    open_type: if desktop_file.terminal() {
-                        OpenType::Terminal
-                    } else {
-                        OpenType::Graphical
-                    },
-                })
-            })
-            .collect();
-        entries.extend(new_entries);
-    }
-    let mut soc = niri_ipc::socket::Socket::connect().unwrap();
-    let response = soc.send(Request::Windows).unwrap().unwrap();
-    let windows = match response {
-        Response::Windows(windows) => Ok::<Vec<niri_ipc::Window>, String>(windows),
-        _ => Err("Unexpected response type".into()),
-    }
-    .unwrap_or_default();
-    for window in windows {
-        let mut entry = Entry::default();
-        entry.name = window.title.unwrap_or_default();
-        entry.exec = window.id.to_string();
-        entry.icon = window.app_id.unwrap();
-        entry.open_type = OpenType::Window;
-        entries.push(entry);
-    }
-    entries
-}
+use types::Entry;
+use usage::UsageTracker;
 
 #[derive(Debug)]
 struct EntryView {
@@ -110,8 +38,8 @@ impl FactoryComponent for EntryView {
         #[root]
         root_box = gtk::Box {
             set_spacing: 6,
+            #[name = "icon_image"]
             gtk::Image {
-                set_icon_name: Some(&self.entry.icon),
                 set_pixel_size: 32,
             },
             gtk::Button {
@@ -136,6 +64,25 @@ impl FactoryComponent for EntryView {
         }
     }
 
+    fn init_widgets(
+        &mut self,
+        _index: &DynamicIndex,
+        root: Self::Root,
+        _returned_widget: &<Self::ParentWidget as relm4::factory::FactoryView>::ReturnedWidget,
+        _sender: FactorySender<Self>,
+    ) -> Self::Widgets {
+        let widgets = view_output!();
+
+        // Set icon based on whether it's a file path or icon name
+        if self.entry.icon.starts_with('/') {
+            widgets.icon_image.set_from_file(Some(&self.entry.icon));
+        } else {
+            widgets.icon_image.set_icon_name(Some(&self.entry.icon));
+        }
+
+        widgets
+    }
+
     fn update(&mut self, msg: Self::Input, _sender: FactorySender<Self>) {
         self.selected = msg;
     }
@@ -150,6 +97,7 @@ struct App {
     scrolled_window: gtk::ScrolledWindow,
     search_entry: gtk::SearchEntry,
     window: adw::ApplicationWindow,
+    usage_tracker: UsageTracker,
 }
 
 impl std::fmt::Debug for App {
@@ -223,11 +171,20 @@ impl SimpleComponent for App {
             .launch(gtk::Box::default())
             .detach();
 
-        let app_entries = get_entries();
+        let app_entries = get_entries().unwrap_or_else(|e| {
+            eprintln!("Failed to load entries: {}", e);
+            vec![]
+        });
+
         let first_name = app_entries
             .first()
             .map(|e| e.name.clone())
             .unwrap_or_default();
+
+        let usage_tracker = UsageTracker::load().unwrap_or_else(|e| {
+            eprintln!("Failed to load usage tracker: {}", e);
+            UsageTracker::new()
+        });
 
         let mut model = App {
             selected_name: first_name,
@@ -238,6 +195,7 @@ impl SimpleComponent for App {
             scrolled_window: gtk::ScrolledWindow::new(),
             search_entry: gtk::SearchEntry::new(),
             window: root.clone(),
+            usage_tracker,
         };
 
         // Add all desktop entries to the factory
@@ -374,47 +332,19 @@ impl SimpleComponent for App {
             }
             Msg::SelectEntry => {
                 if let Some(entry) = self.entries.get(self.selected_index) {
-                    let exec = entry.entry.exec.clone();
-
-                    match entry.entry.open_type {
-                        OpenType::Terminal => {
-                            // Launch a terminal application
-                            let mut soc = niri_ipc::socket::Socket::connect().unwrap();
-                            soc.send(Request::Action(Action::Spawn {
-                                command: vec![
-                                    "ghostty".to_string(),
-                                    "-c".to_string(),
-                                    exec.clone(),
-                                ],
-                            }))
-                            .unwrap()
-                            .unwrap();
+                    if let Err(e) = launch_entry(&entry.entry) {
+                        eprintln!("Failed to launch entry: {}", e);
+                    } else {
+                        // Record usage for non-window entries
+                        if entry.entry.open_type != types::OpenType::Window {
+                            self.usage_tracker.record_launch(&entry.entry.name);
+                            if let Err(e) = self.usage_tracker.save() {
+                                eprintln!("Failed to save usage data: {}", e);
+                            }
                         }
-                        OpenType::Graphical => {
-                            // Launch a graphical application
-                            let mut soc = niri_ipc::socket::Socket::connect().unwrap();
-                            soc.send(Request::Action(Action::Spawn {
-                                command: exec
-                                    .split_whitespace()
-                                    .map(|s| s.to_string())
-                                    .filter(|s| !s.contains('%'))
-                                    .collect(),
-                            }))
-                            .unwrap()
-                            .unwrap();
-                        }
-                        OpenType::Window => {
-                            // Focus a window
-                            let mut soc = niri_ipc::socket::Socket::connect().unwrap();
-                            soc.send(Request::Action(Action::FocusWindow {
-                                id: entry.entry.exec.parse::<u64>().unwrap(),
-                            }))
-                            .unwrap()
-                            .unwrap();
-                        }
+                        // Close the window on successful launch
+                        sender.input(Msg::CloseWindow);
                     }
-                    // Close the window
-                    sender.input(Msg::CloseWindow);
                 }
             }
             Msg::CloseWindow => {
@@ -426,7 +356,10 @@ impl SimpleComponent for App {
             }
             Msg::WindowShown => {
                 // Reload all entries when window is shown
-                self.all_entries = get_entries();
+                match get_entries() {
+                    Ok(entries) => self.all_entries = entries,
+                    Err(e) => eprintln!("Failed to reload entries: {}", e),
+                }
                 self.search_query.clear();
                 self.search_entry.set_text("");
                 self.filter_entries();
@@ -447,25 +380,46 @@ impl App {
         self.entries.guard().clear();
 
         if self.search_query.is_empty() {
-            // Show all entries if search is empty
-            for entry in &self.all_entries {
-                self.entries.guard().push_back(entry.clone());
+            // When no search query, sort by recent usage
+            let mut sorted_entries: Vec<(f64, Entry)> = self
+                .all_entries
+                .iter()
+                .map(|entry| {
+                    let boost = self.usage_tracker.calculate_boost(&entry.name);
+                    (boost, entry.clone())
+                })
+                .collect();
+
+            // Sort by usage boost (highest first)
+            sorted_entries
+                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            for (_boost, entry) in sorted_entries {
+                self.entries.guard().push_back(entry);
             }
         } else {
             // Use fuzzy matching to filter entries
             let matcher = SkimMatcherV2::default();
-            let mut scored_entries: Vec<(i64, Entry)> = self
+            let mut scored_entries: Vec<(f64, Entry)> = self
                 .all_entries
                 .iter()
                 .filter_map(|entry| {
                     matcher
                         .fuzzy_match(&entry.name, &self.search_query)
-                        .map(|score| (score, entry.clone()))
+                        .map(|fuzzy_score| {
+                            // Calculate combined score with usage boost
+                            let usage_boost = self.usage_tracker.calculate_boost(&entry.name);
+                            // Fuzzy score is the primary factor, usage provides a boost
+                            // Usage boost can add up to 50% to the fuzzy score
+                            let combined_score = fuzzy_score as f64 * (1.0 + usage_boost * 0.5);
+                            (combined_score, entry.clone())
+                        })
                 })
                 .collect();
 
-            // Sort by score (highest first)
-            scored_entries.sort_by(|a, b| b.0.cmp(&a.0));
+            // Sort by combined score (highest first)
+            scored_entries
+                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
             // Add filtered and sorted entries
             for (_score, entry) in scored_entries {
@@ -559,14 +513,7 @@ fn main() {
     let has_service_flag = std::env::args().nth(1) == Some("--gapplication-service".to_string());
 
     if !has_service_flag {
-        let gtk_app = relm4::main_adw_application();
-
-        gtk_app.connect_startup(move |app| {
-            // Only print if we're the primary instance (not remote)
-            if !app.is_remote() {
-                println!("Please run with --gapplication-service");
-            }
-        });
+        eprintln!("Please run with --gapplication-service");
     }
 
     app.run::<App>(());
